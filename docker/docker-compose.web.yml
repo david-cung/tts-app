@@ -1,0 +1,24 @@
+services:
+  web:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.web
+    image: ${IMAGE_NAME:-vieneu-tts-web}:${IMAGE_TAG:-cpu}
+    container_name: vieneu-tts-web
+    ports:
+      - "${PORT:-7860}:7860"
+    environment:
+      - HF_HOME=/data/huggingface
+      - GRADIO_SERVER_NAME=0.0.0.0
+      - GRADIO_SERVER_PORT=7860
+      - GRADIO_SHARE=0
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - huggingface_cache:/data/huggingface
+      - vieneu_outputs:/app/outputs
+      - ../finetune/dataset:/app/finetune/dataset
+    restart: unless-stopped
+
+volumes:
+  huggingface_cache:
+  vieneu_outputs:
