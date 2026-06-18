@@ -18,6 +18,7 @@ outputs/
 # Finetune Data & Checkpoints
 finetune/dataset/
 finetune/output/
+finetune/user_voices/
 
 # Merged Models
 merged_models_cache/

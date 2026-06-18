@@ -95,8 +95,14 @@ class VieNeuDataset(Dataset):
         
         return preprocess_sample(data_item, self.tokenizer, self.max_len)
 
-def run_training():
-    model_name = training_config['model']
+def run_training(run_name=None, max_steps=None):
+    config = dict(training_config)
+    if run_name:
+        config["run_name"] = run_name
+    if max_steps is not None:
+        config["max_steps"] = int(max_steps)
+
+    model_name = config['model']
     print(f"🦜 Đang tải model gốc: {model_name}")
     
     # Load Tokenizer
@@ -127,7 +133,7 @@ def run_training():
     model.print_trainable_parameters()
     
     # Trainer Setup
-    args = get_training_args(training_config)
+    args = get_training_args(config)
 
     trainer = Trainer(
         model=model,
@@ -141,10 +147,21 @@ def run_training():
     trainer.train()
     
     # Save Final Model
-    save_path = os.path.join(training_config['output_dir'], training_config['run_name'])
+    save_path = os.path.join(config['output_dir'], config['run_name'])
     print(f"🦜 Đang lưu model LoRA tại: {save_path}")
     model.save_pretrained(save_path)
     tokenizer.save_pretrained(save_path)
+
+    try:
+        from finetune.preview_trained_voice import generate_training_preview
+
+        print("🎧 Đang tạo file nghe thử preview_sample.wav...")
+        preview_path = generate_training_preview(save_path)
+        print(f"✅ Đã lưu mẫu nghe thử tại: {preview_path}")
+    except Exception as exc:
+        print(f"⚠️ Không tạo được preview mẫu sau train: {exc}")
+        print("   Bạn vẫn có thể tạo preview trong tab Voice Training hoặc chạy:")
+        print(f"   uv run python finetune/preview_trained_voice.py {save_path}")
 
 if __name__ == "__main__":
     run_training()

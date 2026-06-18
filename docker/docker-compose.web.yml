@@ -17,6 +17,8 @@ services:
       - huggingface_cache:/data/huggingface
       - vieneu_outputs:/app/outputs
       - ../finetune/dataset:/app/finetune/dataset
+      - ../finetune/output:/app/finetune/output
+      - ../finetune/user_voices:/app/finetune/user_voices
     restart: unless-stopped
 
 volumes:

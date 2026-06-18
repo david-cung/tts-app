@@ -11,6 +11,7 @@ import gradio as gr
 import numpy as np
 import soundfile as sf
 from functools import lru_cache
+from typing import Optional
 
 _REFERENCE_AUDIO_CACHE = {}
 _WHISPER_MODEL_CACHE = {}
@@ -698,6 +699,141 @@ def save_voice_training_dataset(audio_files, script_file=None, script_text=""):
         error_message = f"Lỗi lưu dataset: {exc}"
         gr.Warning(error_message, title="Không thể lưu dataset")
         return f"## ❌ Không thể lưu dataset\n\n{exc}", []
+
+DEFAULT_TRAINING_PREVIEW_TEXT = (
+    "Xin chào, đây là giọng nói sau khi fine-tune với VieNeu-TTS. "
+    "Bạn có thể nghe thử để kiểm tra độ giống với dữ liệu huấn luyện."
+)
+
+def _project_root_dir():
+    return os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+
+def refresh_training_checkpoint_dropdown():
+    try:
+        from finetune.preview_trained_voice import list_training_checkpoints
+
+        checkpoints = list_training_checkpoints()
+        if not checkpoints:
+            return (
+                gr.update(choices=[], value=None),
+                "Chưa có checkpoint LoRA trong `finetune/output/`. Hãy train xong rồi bấm **🔄**.",
+                None,
+            )
+
+        status = (
+            f"Tìm thấy **{len(checkpoints)}** checkpoint. "
+            "Chọn checkpoint để nghe `preview_sample.wav` hoặc nhập văn bản rồi bấm **▶️ Nghe thử**."
+        )
+        return gr.update(choices=checkpoints, value=checkpoints[0]), status, None
+    except Exception as exc:
+        return gr.update(choices=[], value=None), f"❌ Không đọc được checkpoint: {exc}", None
+
+def on_training_checkpoint_selected(checkpoint):
+    if not checkpoint:
+        return None, "Chọn checkpoint LoRA để nghe thử."
+
+    try:
+        from finetune.preview_trained_voice import get_preview_sample_path
+
+        sample_path = get_preview_sample_path(checkpoint)
+        if sample_path:
+            return sample_path, (
+                f"✅ Đã tìm thấy mẫu preview: `{os.path.basename(sample_path)}`.\n\n"
+                "Bạn có thể nghe ngay hoặc nhập văn bản khác rồi bấm **▶️ Nghe thử**."
+            )
+        return None, (
+            "Checkpoint này chưa có `preview_sample.wav`.\n\n"
+            "Bấm **▶️ Nghe thử** để tạo audio (cần PyTorch/GPU). "
+            "Hoặc chạy `uv run python finetune/preview_trained_voice.py <checkpoint>` sau khi train."
+        )
+    except Exception as exc:
+        return None, f"❌ Không đọc được preview: {exc}"
+
+def preview_trained_voice_audio(checkpoint, preview_text):
+    try:
+        if not checkpoint:
+            raise ValueError("Vui lòng chọn checkpoint LoRA.")
+
+        text = (preview_text or DEFAULT_TRAINING_PREVIEW_TEXT).strip()
+        if not text:
+            raise ValueError("Vui lòng nhập văn bản để nghe thử.")
+
+        from finetune.preview_trained_voice import generate_training_preview
+
+        output_path = generate_training_preview(checkpoint, text=text)
+        sample_path = output_path
+        if text.strip() == DEFAULT_TRAINING_PREVIEW_TEXT:
+            message = (
+                f"✅ Đã tạo mẫu preview tại `{os.path.basename(output_path)}`.\n\n"
+                "Audio bên dưới sẽ tự phát — bạn có thể bấm play để nghe lại."
+            )
+        else:
+            message = (
+                f"✅ Đã tạo audio thử cho checkpoint `{checkpoint}`.\n\n"
+                "Audio bên dưới sẽ tự phát — bạn có thể bấm play để nghe lại."
+            )
+        return output_path, sample_path, message
+    except Exception as exc:
+        return gr.update(), gr.update(), f"❌ Không tạo được audio thử: {exc}"
+
+def build_registered_voice_dropdown_update(selected_voice_id: Optional[str] = None):
+    from apps.user_voice_runtime import merge_voice_dropdown_choices
+
+    choices = merge_voice_dropdown_choices()
+    if not choices:
+        return gr.update(choices=[], value=None)
+
+    selected_value = None
+    if selected_voice_id:
+        selected_value = f"user_voice:{selected_voice_id}"
+        if not any(
+            (item[1] if isinstance(item, (list, tuple)) else item) == selected_value
+            for item in choices
+        ):
+            selected_value = None
+
+    if selected_value is None:
+        first = choices[0]
+        selected_value = first[1] if isinstance(first, (list, tuple)) else first
+
+    return gr.update(choices=choices, value=selected_value, interactive=True)
+
+def add_custom_voice_from_dataset(voice_display_name):
+    import threading
+
+    from finetune.voice_training_pipeline import run_voice_training_pipeline
+
+    messages = ["⏳ Đang chuẩn bị train giọng mới..."]
+    result = {"entry": None, "error": None, "done": False}
+
+    def worker():
+        try:
+            result["entry"] = run_voice_training_pipeline(
+                voice_display_name,
+                progress=lambda message: messages.append(message),
+            )
+        except Exception as exc:
+            result["error"] = str(exc)
+        finally:
+            result["done"] = True
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    while not result["done"]:
+        yield "\n\n".join(messages), gr.update(), gr.update(selected="preset_mode"), gr.update()
+        time.sleep(2)
+
+    if result["error"]:
+        messages.append(f"❌ Không thêm được giọng: {result['error']}")
+        yield "\n\n".join(messages), gr.update(), gr.update(), gr.update()
+        return
+
+    entry = result["entry"]
+    messages.append(
+        f"✅ Giọng **{entry['display_name']}** đã sẵn sàng trong tab **Preset** (biểu tượng 🎤)."
+    )
+    voice_update = build_registered_voice_dropdown_update(entry["voice_id"])
+    yield "\n\n".join(messages), voice_update, gr.update(selected="preset_mode"), gr.update(interactive=True)
 
 def on_custom_id_change(model_id):
     # Auto detect LoRA and base model

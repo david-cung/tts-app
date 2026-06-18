@@ -40,8 +40,15 @@ from apps.ui_utils import (
     preview_voice_training_dataset,
     transcribe_voice_training_audio,
     save_voice_training_dataset,
-    on_custom_id_change
+    on_custom_id_change,
+    DEFAULT_TRAINING_PREVIEW_TEXT,
+    refresh_training_checkpoint_dropdown,
+    on_training_checkpoint_selected,
+    preview_trained_voice_audio,
+    build_registered_voice_dropdown_update,
+    add_custom_voice_from_dataset,
 )
+from apps.user_voice_runtime import get_user_voice_entry, merge_voice_dropdown_choices, synthesize_registered_voice
 from apps.ui_constants import (
     theme,
     css,
@@ -119,10 +126,14 @@ def restore_ui_state():
     """Update UI components based on persistence"""
     global model_loaded
     msg = get_model_status_message()
+    from finetune.voice_registry import list_user_voice_dropdown_choices
+
+    can_generate = model_loaded or bool(list_user_voice_dropdown_choices())
     return (
-        msg, 
-        gr.update(interactive=model_loaded), # btn_generate
-        gr.update(interactive=False)         # btn_stop
+        msg,
+        gr.update(interactive=can_generate),
+        gr.update(interactive=False),
+        build_registered_voice_dropdown_update(),
     )
 
 def load_model(backbone_choice: str, codec_choice: str, device_choice: str, 
@@ -253,15 +264,24 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
             else:
                 voices.sort()
 
-            voice_update = gr.update(choices=voices, value=default_v, interactive=True)
+            voice_update = gr.update(
+                choices=merge_voice_dropdown_choices(voices),
+                value=default_v,
+                interactive=True,
+            )
             
             tab_p = gr.update(visible=True)
             tab_c = gr.update(visible=True)
             tab_sel = gr.update(selected="preset_mode")
             mode_state = "preset_mode"
         else:
-            msg = "⚠️ Không tìm thấy file voices.json. Vui lòng dùng Tab Voice Cloning."
-            voice_update = gr.update(choices=[msg], value=msg, interactive=False)
+            user_choices = merge_voice_dropdown_choices()
+            if user_choices:
+                default_user = user_choices[0][1] if isinstance(user_choices[0], (list, tuple)) else user_choices[0]
+                voice_update = gr.update(choices=user_choices, value=default_user, interactive=True)
+            else:
+                msg = "⚠️ Không tìm thấy file voices.json. Vui lòng dùng Tab Voice Cloning."
+                voice_update = gr.update(choices=[msg], value=msg, interactive=False)
             
             tab_p = gr.update(visible=True)
             tab_c = gr.update(visible=True)
@@ -301,15 +321,24 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
     """Synthesis using XPU logic (Sequential generation with autocast)"""
     global tts, current_backbone, current_codec, model_loaded
     
-    if not model_loaded or tts is None:
-        yield None, "⚠️ Vui lòng tải model trước!"
-        return
-    
     if not text or text.strip() == "":
         yield None, "⚠️ Vui lòng nhập văn bản!"
         return
-    
+
     raw_text = text.strip()
+
+    if mode_tab == "preset_mode" and get_user_voice_entry(voice_choice):
+        try:
+            yield None, "📦 Đang tải giọng tự train..."
+            out_path, status = synthesize_registered_voice(raw_text, voice_choice, temperature=temperature)
+            yield out_path, status
+        except Exception as exc:
+            yield None, f"❌ Lỗi giọng tự train: {exc}"
+        return
+
+    if not model_loaded or tts is None:
+        yield None, "⚠️ Vui lòng tải model trước!"
+        return
     
     yield None, "📄 Đang xử lý Reference..."
     
@@ -726,7 +755,10 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS (XPU)", head=head_html) a
                                     file_types=[".wav"],
                                     type="filepath",
                                 )
-                                training_audio_status = gr.Markdown()
+                                training_audio_status = gr.Markdown(
+                                    "Upload file audio/video dài phía trên, rồi bấm **Cắt thành WAV**.",
+                                    container=True,
+                                )
                                 training_audio_table = gr.Dataframe(
                                     headers=["#", "file WAV", "duration"],
                                     datatype=["str", "str", "str"],
@@ -766,6 +798,55 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS (XPU)", head=head_html) a
                             datatype=["str", "str", "str", "str"],
                             interactive=False,
                         )
+
+                        with gr.Accordion("➕ Thêm giọng đọc (tự động train)", open=False):
+                            gr.Markdown(
+                                "Sau khi **Lưu dataset**, nhập tên giọng và bấm **Thêm giọng đọc**. "
+                                "App sẽ tự lọc → mã hóa → train LoRA → tạo preset. **Cần GPU**."
+                            )
+                            training_voice_name = gr.Textbox(
+                                label="Tên giọng đọc",
+                                placeholder="Ví dụ: Giọng Mai, Anh Tuấn podcast...",
+                            )
+                            btn_add_custom_voice = gr.Button("➕ Thêm giọng đọc", variant="primary")
+                            training_add_voice_status = gr.Markdown(
+                                "Chưa train giọng mới.",
+                                container=True,
+                            )
+
+                        with gr.Accordion("🔊 Nghe thử sau train", open=False):
+                            gr.Markdown(
+                                "Sau khi train LoRA, chọn checkpoint để nghe `preview_sample.wav` "
+                                "hoặc nhập văn bản tùy ý. Sinh audio thử cần PyTorch (`uv sync --group gpu`)."
+                            )
+                            with gr.Row():
+                                training_checkpoint_select = gr.Dropdown(
+                                    choices=[],
+                                    label="Checkpoint LoRA",
+                                    scale=4,
+                                )
+                                btn_refresh_training_checkpoints = gr.Button("🔄", scale=0, min_width=64)
+                            training_preview_listen_status = gr.Markdown(
+                                "Bấm **🔄** để tải danh sách checkpoint từ `finetune/output/`.",
+                                container=True,
+                            )
+                            training_preview_sample_audio = gr.Audio(
+                                label="Mẫu sau train (preview_sample.wav)",
+                                type="filepath",
+                                interactive=False,
+                            )
+                            training_preview_text = gr.Textbox(
+                                label="Văn bản thử",
+                                lines=2,
+                                value=DEFAULT_TRAINING_PREVIEW_TEXT,
+                            )
+                            btn_training_preview_play = gr.Button("▶️ Nghe thử", variant="primary")
+                            training_preview_output_audio = gr.Audio(
+                                label="Kết quả nghe thử",
+                                type="filepath",
+                                autoplay=True,
+                                interactive=False,
+                            )
                 
                 generation_mode = gr.Radio(
                     ["Standard (Một lần)"],
@@ -857,7 +938,8 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS (XPU)", head=head_html) a
             fn=split_voice_training_media,
             inputs=[training_long_media, training_min_duration, training_max_duration, training_silence_ms],
             outputs=[training_audio_files, training_audio_status, training_audio_table,
-                     training_script_text, training_preview]
+                     training_script_text, training_preview],
+            show_progress="full",
         )
 
         btn_preview_training.click(
@@ -876,6 +958,36 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS (XPU)", head=head_html) a
             fn=save_voice_training_dataset,
             inputs=[training_audio_files, training_script_file, training_script_text],
             outputs=[training_status, training_preview]
+        )
+
+        btn_refresh_training_checkpoints.click(
+            fn=refresh_training_checkpoint_dropdown,
+            outputs=[training_checkpoint_select, training_preview_listen_status, training_preview_sample_audio],
+        )
+
+        training_checkpoint_select.change(
+            fn=on_training_checkpoint_selected,
+            inputs=[training_checkpoint_select],
+            outputs=[training_preview_sample_audio, training_preview_listen_status],
+        )
+
+        tab_training.select(
+            fn=refresh_training_checkpoint_dropdown,
+            outputs=[training_checkpoint_select, training_preview_listen_status, training_preview_sample_audio],
+        )
+
+        btn_training_preview_play.click(
+            fn=preview_trained_voice_audio,
+            inputs=[training_checkpoint_select, training_preview_text],
+            outputs=[training_preview_output_audio, training_preview_sample_audio, training_preview_listen_status],
+            show_progress="full",
+        )
+
+        btn_add_custom_voice.click(
+            fn=add_custom_voice_from_dataset,
+            inputs=[training_voice_name],
+            outputs=[training_add_voice_status, voice_select, tabs, btn_generate],
+            show_progress="full",
         )
 
         def on_backbone_change(choice):
@@ -918,7 +1030,7 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS (XPU)", head=head_html) a
 
         demo.load(
             fn=restore_ui_state,
-            outputs=[model_status, btn_generate, btn_stop]
+            outputs=[model_status, btn_generate, btn_stop, voice_select]
         )
 
 def main():
