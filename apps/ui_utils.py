@@ -295,6 +295,138 @@ def _build_vad_training_segments(speech_chunks, total_samples, min_samples, max_
 
     return [(start, end) for start, end in combined if end > start]
 
+def _score_voice_reference_segment(audio, start, end, sample_rate, target_duration):
+    """Score a VAD segment for reusable voice reference quality."""
+    clip = np.asarray(audio[start:end], dtype=np.float32)
+    if clip.size == 0:
+        return float("-inf")
+
+    duration = clip.size / float(sample_rate)
+    abs_clip = np.abs(clip)
+    rms = float(np.sqrt(np.mean(np.square(clip)) + 1e-12))
+    peak = float(np.max(abs_clip)) if abs_clip.size else 0.0
+    silence_ratio = float(np.mean(abs_clip < 0.005))
+    clipped_ratio = float(np.mean(abs_clip > 0.98))
+    dynamic_range = float(np.percentile(abs_clip, 95) - np.percentile(abs_clip, 20))
+
+    duration_score = max(0.0, 1.0 - abs(duration - target_duration) / max(target_duration, 1.0))
+    loudness_score = min(rms / 0.06, 1.0)
+    peak_penalty = max(0.0, peak - 0.95) * 6.0
+
+    return (
+        duration_score * 4.0
+        + loudness_score * 2.0
+        + dynamic_range * 6.0
+        - silence_ratio * 1.5
+        - clipped_ratio * 12.0
+        - peak_penalty
+    )
+
+def prepare_best_voice_training_reference(
+    media_file,
+    min_duration=3.0,
+    target_duration=10.0,
+    max_duration=15.0,
+):
+    """Extract the best short speech-only WAV from an uploaded audio/video file.
+
+    The Voice Training button uses this before encoding a reusable voice preset.
+    It intentionally avoids encoding a full long recording because silence,
+    music, room noise, or speaker changes make the cloned voice less stable.
+    """
+    source = _coerce_audio_path(media_file)
+    if not source:
+        raise ValueError("Vui lòng upload một file giọng đọc.")
+
+    source = os.path.abspath(os.fspath(source))
+    if not os.path.isfile(source):
+        raise FileNotFoundError(f"Không tìm thấy file nguồn: {source}")
+
+    try:
+        from faster_whisper.audio import decode_audio
+        from faster_whisper.vad import VadOptions, get_speech_timestamps
+    except ImportError as exc:
+        raise RuntimeError(
+            "Chưa cài faster-whisper nên không thể tự cắt đoạn giọng tốt nhất."
+        ) from exc
+
+    sample_rate = 16_000
+    audio = np.asarray(decode_audio(source, sampling_rate=sample_rate), dtype=np.float32)
+    if audio.size == 0:
+        raise ValueError("File nguồn không có dữ liệu audio.")
+
+    min_duration = float(min_duration)
+    target_duration = float(target_duration)
+    max_duration = float(max_duration)
+    if min_duration <= 0 or target_duration < min_duration or max_duration < target_duration:
+        raise ValueError("Cấu hình thời lượng cắt giọng không hợp lệ.")
+
+    vad_options = VadOptions(
+        min_speech_duration_ms=300,
+        max_speech_duration_s=max_duration,
+        min_silence_duration_ms=350,
+        speech_pad_ms=180,
+    )
+    speech_chunks = get_speech_timestamps(audio, vad_options, sampling_rate=sample_rate)
+    total_duration = audio.size / float(sample_rate)
+
+    if not speech_chunks:
+        if total_duration <= max_duration:
+            segments = [(0, audio.size)]
+            vad_note = "Không tách được VAD rõ ràng, dùng toàn bộ file vì audio đang ngắn."
+        else:
+            raise ValueError(
+                "Không phát hiện được đoạn có giọng nói rõ trong file. "
+                "Hãy thử upload file ít nhạc nền/ít nhiễu hơn."
+            )
+    else:
+        segments = _build_vad_training_segments(
+            speech_chunks,
+            total_samples=len(audio),
+            min_samples=int(min_duration * sample_rate),
+            max_samples=int(max_duration * sample_rate),
+        )
+        vad_note = ""
+
+    if not segments:
+        raise ValueError("Không tìm được đoạn giọng đủ dài để training.")
+
+    best_start, best_end = max(
+        segments,
+        key=lambda item: _score_voice_reference_segment(
+            audio,
+            item[0],
+            item[1],
+            sample_rate,
+            target_duration,
+        ),
+    )
+
+    output_dir = os.path.join(
+        tempfile.gettempdir(),
+        "vieneu_tts_best_voice_reference",
+        uuid.uuid4().hex,
+    )
+    os.makedirs(output_dir, exist_ok=True)
+
+    source_stem = _safe_training_filename(os.path.basename(source)).rsplit(".", 1)[0]
+    output_path = os.path.join(output_dir, f"{source_stem}_best.wav")
+    sf.write(output_path, audio[best_start:best_end], sample_rate, subtype="PCM_16")
+
+    selected_duration = (best_end - best_start) / float(sample_rate)
+    metadata = {
+        "source": source,
+        "source_name": os.path.basename(source),
+        "original_duration": total_duration,
+        "selected_duration": selected_duration,
+        "start_sec": best_start / float(sample_rate),
+        "end_sec": best_end / float(sample_rate),
+        "candidate_count": len(segments),
+        "was_trimmed": abs(selected_duration - total_duration) > 0.25,
+        "note": vad_note,
+    }
+    return output_path, metadata
+
 def split_voice_training_media(media_file, min_duration=3, max_duration=15, silence_ms=600):
     """Split one long audio/video file into training WAV clips using Silero VAD."""
     try:
