@@ -1,5 +1,8 @@
 import sys
 import io
+import json
+import re
+import shutil
 if sys.platform == "win32":
     try:
         sys.stdout.reconfigure(encoding="utf-8")
@@ -40,6 +43,7 @@ from apps.ui_utils import (
     validate_audio_duration,
     validate_and_cache_reference_audio,
     prepare_reference_audio,
+    prepare_best_voice_training_reference,
     split_voice_training_media,
     inspect_voice_training_audio,
     preview_voice_training_dataset,
@@ -65,6 +69,9 @@ from apps.ui_constants import (
 
 # --- CONSTANTS & CONFIG ---
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.yaml")
+APP_ROOT = os.path.dirname(os.path.dirname(__file__))
+USER_VOICES_DIR = os.path.join(APP_ROOT, "finetune", "dataset", "user_voices")
+USER_VOICES_INDEX = os.path.join(USER_VOICES_DIR, "voices.json")
 try:
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         _config = yaml.safe_load(f) or {}
@@ -636,6 +643,7 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
         current_backbone = backbone_choice
         current_codec = codec_choice
         model_loaded = True
+        user_voice_count = load_user_trained_voices()
         
         # Success message with optimization info
         backend_name = "🚀 LMDeploy (Optimized)" if using_lmdeploy else "📦 Standard"
@@ -664,6 +672,8 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
              )
 
         success_msg = get_model_status_message()
+        if user_voice_count:
+            success_msg += f"\n\n✅ Đã nạp **{user_voice_count} giọng đã tạo** từ máy này."
         if warning_msg:
             success_msg += warning_msg
             
@@ -815,6 +825,226 @@ def resolve_voice_id(v_id: str) -> str:
             
     return v_id
 
+def _voice_slug(value: str) -> str:
+    value = (value or "").strip()
+    value = re.sub(r"\s+", "_", value)
+    value = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in value)
+    value = re.sub(r"_+", "_", value).strip("_")
+    return value or f"voice_{uuid.uuid4().hex[:8]}"
+
+def _to_numpy_codes(codes):
+    if "torch" in sys.modules:
+        import torch
+        if isinstance(codes, torch.Tensor):
+            return codes.detach().cpu().numpy()
+    return np.asarray(codes)
+
+def _read_user_voice_index():
+    if not os.path.exists(USER_VOICES_INDEX):
+        return {"voices": []}
+    try:
+        with open(USER_VOICES_INDEX, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {"voices": []}
+        voices = data.get("voices")
+        if not isinstance(voices, list):
+            data["voices"] = []
+        return data
+    except Exception as exc:
+        print(f"⚠️ Could not read user voices index: {exc}")
+        return {"voices": []}
+
+def _write_user_voice_index(data):
+    os.makedirs(USER_VOICES_DIR, exist_ok=True)
+    with open(USER_VOICES_INDEX, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def _make_unique_voice_id(label: str) -> str:
+    base = (label or "").strip() or "Giọng của tôi"
+    candidate = base
+    counter = 2
+    existing = set(getattr(tts, "_preset_voices", {}) or {})
+    while candidate in existing:
+        candidate = f"{base} {counter}"
+        counter += 1
+    return candidate
+
+def _save_user_voice_record(voice_id: str, description: str, codes, source_audio_path: str):
+    os.makedirs(USER_VOICES_DIR, exist_ok=True)
+    slug = _voice_slug(voice_id)
+    codes_file = f"{slug}.npz"
+    audio_file = f"{slug}.wav"
+    codes_path = os.path.join(USER_VOICES_DIR, codes_file)
+    audio_path = os.path.join(USER_VOICES_DIR, audio_file)
+
+    np.savez_compressed(codes_path, codes=_to_numpy_codes(codes))
+    shutil.copy2(source_audio_path, audio_path)
+
+    record = {
+        "id": voice_id,
+        "description": description,
+        "codes_file": codes_file,
+        "sample_audio": audio_file,
+        "text": "",
+        "reserved_id": None,
+        "podcast": True,
+        "created_at": int(time.time()),
+    }
+
+    data = _read_user_voice_index()
+    data["voices"] = [item for item in data.get("voices", []) if item.get("id") != voice_id]
+    data["voices"].append(record)
+    _write_user_voice_index(data)
+    return record
+
+def load_user_trained_voices():
+    """Load locally created voices into the active TTS instance."""
+    if tts is None or not hasattr(tts, "_preset_voices"):
+        return 0
+
+    loaded = 0
+    data = _read_user_voice_index()
+    for record in data.get("voices", []):
+        voice_id = record.get("id")
+        codes_file = record.get("codes_file")
+        if not voice_id or not codes_file:
+            continue
+
+        codes_path = os.path.join(USER_VOICES_DIR, codes_file)
+        if not os.path.exists(codes_path):
+            continue
+
+        try:
+            with np.load(codes_path, allow_pickle=False) as payload:
+                codes = payload["codes"]
+            tts._preset_voices[voice_id] = {
+                "description": record.get("description") or f"{voice_id} (giọng đã tạo)",
+                "codes": codes,
+                "text": record.get("text", ""),
+                "reserved_id": record.get("reserved_id"),
+                "podcast": record.get("podcast", True),
+                "user_created": True,
+            }
+            loaded += 1
+        except Exception as exc:
+            print(f"⚠️ Could not load user voice '{voice_id}': {exc}")
+    return loaded
+
+def refresh_voice_choices(selected_voice=None):
+    """Return dropdown updates after preset voices change."""
+    global PRESET_VOICES_CACHE, CONV_VOICES_CACHE
+
+    slot_no_updates = [gr.update()] * MAX_SPEAKERS
+    if tts is None:
+        return gr.update(), slot_no_updates
+
+    try:
+        voices = tts.list_preset_voices()
+    except Exception:
+        voices = []
+
+    if not voices:
+        PRESET_VOICES_CACHE = []
+        CONV_VOICES_CACHE = []
+        return gr.update(choices=[], value=None, interactive=False), [gr.update(choices=[])] * MAX_SPEAKERS
+
+    is_tuple = isinstance(voices[0], (list, tuple)) and len(voices[0]) >= 2
+    if is_tuple:
+        voices = sorted(voices, key=lambda item: str(item[0]))
+        values = [item[1] for item in voices]
+    else:
+        voices = sorted(voices)
+        values = voices
+
+    value = selected_voice if selected_voice in values else getattr(tts, "_default_voice", None)
+    if value not in values:
+        value = values[0] if values else None
+
+    PRESET_VOICES_CACHE = voices
+
+    def _voice_value(item):
+        return item[1] if isinstance(item, (list, tuple)) and len(item) >= 2 else item
+
+    def _check_podcast(item):
+        voice_id = _voice_value(item)
+        val = getattr(tts, "_preset_voices", {}).get(voice_id, {}).get("podcast", True)
+        if isinstance(val, str):
+            return val.strip().lower() == "true"
+        return bool(val)
+
+    CONV_VOICES_CACHE = [item for item in voices if _check_podcast(item)]
+    voice_update = gr.update(choices=voices, value=value, interactive=True)
+    slot_updates = [gr.update(choices=CONV_VOICES_CACHE, value=value)] * MAX_SPEAKERS
+    return voice_update, slot_updates
+
+def create_user_training_voice(voice_name, training_voice_file):
+    """Create a reusable local voice preset from one uploaded reference file."""
+    slot_no_updates = [gr.update()] * MAX_SPEAKERS
+
+    if not model_loaded or tts is None:
+        return (
+            "## ⚠️ Chưa tải model\n\nHãy bấm **Tải Model** trước khi training giọng.",
+            gr.update(),
+            gr.update(),
+            "training_mode",
+            *slot_no_updates,
+    )
+
+    try:
+        stable_audio, clip_info = prepare_best_voice_training_reference(training_voice_file)
+        info = sf.info(stable_audio)
+        voice_id = _make_unique_voice_id(voice_name or os.path.splitext(os.path.basename(stable_audio))[0])
+        description = f"{voice_id} (giọng đã tạo)"
+
+        codes = tts.encode_reference(stable_audio)
+        codes = _to_numpy_codes(codes)
+
+        tts._preset_voices[voice_id] = {
+            "description": description,
+            "codes": codes,
+            "text": "",
+            "reserved_id": None,
+            "podcast": True,
+            "user_created": True,
+        }
+        _save_user_voice_record(voice_id, description, codes, stable_audio)
+
+        voice_update, slot_updates = refresh_voice_choices(selected_voice=voice_id)
+        trim_summary = (
+            f"App đã chọn đoạn **{clip_info['start_sec']:.1f}s - {clip_info['end_sec']:.1f}s** "
+            f"({clip_info['selected_duration']:.1f}s) từ file **{clip_info['source_name']}** "
+            f"dài {clip_info['original_duration']:.1f}s."
+        )
+        if not clip_info.get("was_trimmed"):
+            trim_summary = (
+                f"File **{clip_info['source_name']}** dài {clip_info['original_duration']:.1f}s "
+                "đã đủ ngắn/sạch nên app dùng toàn bộ đoạn này."
+            )
+
+        status = (
+            f"## ✅ Đã tạo giọng `{voice_id}`\n\n"
+            f"{trim_summary}\n\n"
+            f"Đã encode đoạn giọng **{info.duration:.1f}s** và chọn sẵn giọng này trong tab **Preset**. "
+            "Bạn có thể nhập văn bản rồi bấm **Bắt đầu** để dùng ngay.\n\n"
+            f"Giọng được lưu tại: `{USER_VOICES_DIR}`"
+        )
+        if clip_info.get("candidate_count", 0) > 1:
+            status += f"\n\nĐã so sánh **{clip_info['candidate_count']} đoạn có tiếng nói** và chọn đoạn phù hợp nhất."
+        if clip_info.get("note"):
+            status += f"\n\n⚠️ {clip_info['note']}"
+        if info.duration < 3 or info.duration > 15:
+            status += (
+                "\n\n⚠️ Đoạn mẫu lý tưởng nên khoảng 3-15 giây, một người nói rõ, ít nhiễu. "
+                "Nếu kết quả chưa giống, hãy upload lại một đoạn sạch hơn."
+            )
+
+        gr.Info(f"Đã tạo giọng {voice_id}.", title="Training hoàn tất")
+        return status, voice_update, gr.update(selected="preset_mode"), "preset_mode", *slot_updates
+    except Exception as exc:
+        gr.Warning(f"Không thể tạo giọng: {exc}", title="Training thất bại")
+        return f"## ❌ Không thể tạo giọng\n\n{exc}", gr.update(), gr.update(), "training_mode", *slot_no_updates
+
 # --- 2. DATA & HELPERS ---
 
 def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: str, 
@@ -885,7 +1115,7 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
             ref_audio_path = prepare_reference_audio(custom_audio)
             ref_codes = tts.encode_reference(ref_audio_path)
         elif mode_tab == "training_mode":
-            raise ValueError("Tab Voice Training chỉ dùng để chuẩn bị dataset. Hãy chọn Preset hoặc Voice Cloning để tạo giọng.")
+            raise ValueError("Hãy upload file và bấm Training giọng này trước. Sau khi tạo xong, app sẽ tự chọn giọng mới trong tab Preset.")
         else:
             raise ValueError(f"Unknown mode: {mode_tab}")
 
@@ -1862,102 +2092,109 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
 
                             with gr.TabItem("🎙️ Voice Training", id="training_mode") as tab_training:
                                 with gr.Row():
-                                    training_long_media = gr.File(
-                                        label="Audio/video dài để cắt",
+                                    training_voice_name = gr.Textbox(
+                                        label="Tên giọng",
+                                        placeholder="Ví dụ: Giọng của tôi",
+                                        scale=1,
+                                    )
+                                    training_voice_file = gr.File(
+                                        label="Upload file giọng đọc (app tự chọn đoạn tốt nhất)",
                                         file_count="single",
                                         file_types=[".wav", ".mp3", ".flac", ".m4a", ".ogg", ".aac",
                                                     ".mp4", ".mov", ".mkv", ".webm"],
                                         type="filepath",
                                         scale=2,
                                     )
-                                    training_min_duration = gr.Slider(
-                                        minimum=2, maximum=8, value=3, step=1,
-                                        label="Tối thiểu (giây)", scale=1,
-                                    )
-                                    training_max_duration = gr.Slider(
-                                        minimum=8, maximum=20, value=15, step=1,
-                                        label="Tối đa (giây)", scale=1,
-                                    )
-                                    training_silence_ms = gr.Slider(
-                                        minimum=200, maximum=1500, value=600, step=100,
-                                        label="Khoảng lặng (ms)", scale=1,
-                                    )
-                                    btn_split_training = gr.Button("✂️ Cắt thành WAV", variant="secondary", scale=1)
-                                with gr.Row():
-                                    with gr.Column(scale=1):
-                                        training_audio_files = gr.File(
-                                            label="1. WAV training",
-                                            file_count="multiple",
-                                            file_types=[".wav"],
-                                            type="filepath",
-                                        )
-                                        training_audio_status = gr.Markdown(
-                                            "Upload file audio/video dài phía trên, rồi bấm **Cắt thành WAV**.",
-                                            container=True,
-                                        )
-                                        training_audio_table = gr.Dataframe(
-                                            headers=["#", "file WAV", "duration"],
-                                            datatype=["str", "str", "str"],
-                                            interactive=False,
-                                        )
-                                    with gr.Column(scale=1):
-                                        training_script_file = gr.File(
-                                            label="2. Script / transcript (.txt, .csv)",
-                                            file_count="single",
-                                            file_types=[".txt", ".csv"],
-                                            type="filepath",
-                                        )
-                                        training_script_text = gr.Textbox(
-                                            label="Transcript theo thứ tự WAV",
-                                            lines=10,
-                                            placeholder="Dòng 1 ứng với file #1 bên trái\nDòng 2 ứng với file #2 bên trái\nDòng 3 ứng với file #3 bên trái",
-                                        )
-                                        with gr.Row():
-                                            training_whisper_model = gr.Dropdown(
-                                                ["tiny", "base", "small", "medium"],
-                                                value="small",
-                                                label="Whisper model",
-                                                scale=1,
-                                            )
-                                            btn_auto_transcribe = gr.Button("📝 Tạo transcript", variant="secondary", scale=1)
-                                        with gr.Row():
-                                            btn_preview_training = gr.Button("🔎 Xem ghép script", variant="secondary")
-                                            btn_prepare_training = gr.Button("💾 Lưu dataset", variant="primary")
-
-                                        training_status = gr.Markdown(
-                                            "Chưa lưu dataset.",
-                                            container=True,
-                                        )
-
-                                training_preview = gr.Dataframe(
-                                    headers=["#", "file WAV", "duration", "transcript"],
-                                    datatype=["str", "str", "str", "str"],
-                                    interactive=False,
+                                btn_train_voice = gr.Button("🎯 Training giọng này", variant="primary")
+                                training_status = gr.Markdown(
+                                    "Upload file có một người nói rõ, app sẽ tự cắt đoạn tốt nhất rồi tạo giọng. Giọng mới sẽ xuất hiện trong **Preset** để dùng ngay.",
+                                    container=True,
                                 )
 
-                                with gr.Accordion("➕ Thêm giọng đọc (tự động train)", open=False):
+                                with gr.Accordion("Công cụ nâng cao: cắt audio, transcript và lưu dataset", open=False):
+                                    with gr.Row():
+                                        training_long_media = gr.File(
+                                            label="Audio/video dài để cắt",
+                                            file_count="single",
+                                            file_types=[".wav", ".mp3", ".flac", ".m4a", ".ogg", ".aac",
+                                                        ".mp4", ".mov", ".mkv", ".webm"],
+                                            type="filepath",
+                                            scale=2,
+                                        )
+                                        training_min_duration = gr.Slider(
+                                            minimum=2, maximum=8, value=3, step=1,
+                                            label="Tối thiểu (giây)", scale=1,
+                                        )
+                                        training_max_duration = gr.Slider(
+                                            minimum=8, maximum=20, value=15, step=1,
+                                            label="Tối đa (giây)", scale=1,
+                                        )
+                                        training_silence_ms = gr.Slider(
+                                            minimum=200, maximum=1500, value=600, step=100,
+                                            label="Khoảng lặng (ms)", scale=1,
+                                        )
+                                        btn_split_training = gr.Button("✂️ Cắt thành WAV", variant="secondary", scale=1)
+                                    with gr.Row():
+                                        with gr.Column(scale=1):
+                                            training_audio_files = gr.File(
+                                                label="1. WAV training",
+                                                file_count="multiple",
+                                                file_types=[".wav"],
+                                                type="filepath",
+                                            )
+                                            training_audio_status = gr.Markdown(
+                                                "Upload file audio/video dài phía trên, rồi bấm **Cắt thành WAV**.",
+                                                container=True,
+                                            )
+                                            training_audio_table = gr.Dataframe(
+                                                headers=["#", "file WAV", "duration"],
+                                                datatype=["str", "str", "str"],
+                                                interactive=False,
+                                            )
+                                        with gr.Column(scale=1):
+                                            training_script_file = gr.File(
+                                                label="2. Script / transcript (.txt, .csv)",
+                                                file_count="single",
+                                                file_types=[".txt", ".csv"],
+                                                type="filepath",
+                                            )
+                                            training_script_text = gr.Textbox(
+                                                label="Transcript theo thứ tự WAV",
+                                                lines=10,
+                                                placeholder="Dòng 1 ứng với file #1 bên trái\nDòng 2 ứng với file #2 bên trái\nDòng 3 ứng với file #3 bên trái",
+                                            )
+                                            with gr.Row():
+                                                training_whisper_model = gr.Dropdown(
+                                                    ["tiny", "base", "small", "medium"],
+                                                    value="small",
+                                                    label="Whisper model",
+                                                    scale=1,
+                                                )
+                                                btn_auto_transcribe = gr.Button("📝 Tạo transcript", variant="secondary", scale=1)
+                                            with gr.Row():
+                                                btn_preview_training = gr.Button("🔎 Xem ghép script", variant="secondary")
+                                                btn_prepare_training = gr.Button("💾 Lưu dataset", variant="primary")
+
+                                    training_preview = gr.Dataframe(
+                                        headers=["#", "file WAV", "duration", "transcript"],
+                                        datatype=["str", "str", "str", "str"],
+                                        interactive=False,
+                                    )
+
+                                with gr.Accordion("➕ Thêm giọng từ dataset (train LoRA)", open=False):
                                     gr.Markdown(
-                                        "Sau khi **Lưu dataset**, nhập tên giọng và bấm **Thêm giọng đọc**. "
-                                        "App sẽ tự lọc → mã hóa → train LoRA → tạo preset. "
-                                        "**Cần GPU** (`uv sync --group gpu`), không chạy trên Docker web CPU."
+                                        "Sau khi **Lưu dataset**, dùng **Tên giọng** ở trên rồi bấm **Thêm giọng đọc**. "
+                                        "App sẽ tự lọc → mã hóa → train LoRA. **Cần GPU** (`uv sync --group gpu`)."
                                     )
-                                    training_voice_name = gr.Textbox(
-                                        label="Tên giọng đọc",
-                                        placeholder="Ví dụ: Giọng Mai, Anh Tuấn podcast...",
-                                    )
-                                    btn_add_custom_voice = gr.Button(
-                                        "➕ Thêm giọng đọc",
-                                        variant="primary",
-                                    )
+                                    btn_add_custom_voice = gr.Button("➕ Thêm giọng đọc", variant="primary")
                                     training_add_voice_status = gr.Markdown(
-                                        "Chưa train giọng mới.",
+                                        "Chưa train giọng mới từ dataset.",
                                         container=True,
                                     )
 
                                 with gr.Accordion("🔊 Nghe thử sau train", open=False):
                                     gr.Markdown(
-                                        "Sau khi train LoRA, chọn checkpoint để nghe `preview_sample.wav` "
-                                        "hoặc nhập văn bản tùy ý. Sinh audio thử cần PyTorch (`uv sync --group gpu`)."
+                                        "Chọn checkpoint LoRA để nghe `preview_sample.wav` hoặc nhập văn bản thử."
                                     )
                                     with gr.Row():
                                         training_checkpoint_select = gr.Dropdown(
@@ -2134,6 +2371,12 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
             validate_and_cache_reference_audio,
             inputs=[custom_audio],
             outputs=[cloning_warning_msg]
+        )
+
+        btn_train_voice.click(
+            fn=create_user_training_voice,
+            inputs=[training_voice_name, training_voice_file],
+            outputs=[training_status, voice_select, tabs, current_mode_state, *speaker_voice_dds]
         )
 
         training_audio_files.change(
