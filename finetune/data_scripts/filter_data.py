@@ -8,8 +8,6 @@ ACRONYM_NO_PERIOD = re.compile(r"(?:[A-Z]){2,}")
 def text_filter(text: str) -> bool:
     if not text:
         return False
-    if re.search(r"\d", text):
-        return False
     if ACRONYM.search(text) or ACRONYM_NO_PERIOD.search(text):
         return False
     if text[-1] not in ".,?!":
@@ -87,7 +85,7 @@ def filter_and_process_dataset(dataset_dir="finetune/dataset"):
     print(f"     + Không tìm thấy audio: {skipped_counts['audio_not_found']}")
     print(f"     + Lỗi file audio: {skipped_counts['audio_error']}")
     print(f"     + Thời lượng không hợp lệ (3-15s): {skipped_counts['duration_out_of_range']}")
-    print(f"     + Text rác/chứa số: {skipped_counts['text_invalid']}")
+    print(f"     + Text không hợp lệ (thiếu dấu câu / acronym): {skipped_counts['text_invalid']}")
     
     print(f"\n✅ Đã lưu metadata sạch tại: {cleaned_metadata_path}")
 

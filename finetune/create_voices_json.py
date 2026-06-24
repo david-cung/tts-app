@@ -54,7 +54,12 @@ def create_voices_json(audio_path, text, voice_name, output_path="voices.json", 
     
     # Load DistillNeuCodec (same codec VieNeu-TTS uses at inference)
     print("   🔊 Loading DistillNeuCodec...")
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
     codec = DistillNeuCodec.from_pretrained("neuphonic/distill-neucodec").to(device)
     codec.eval()
 
@@ -81,6 +86,10 @@ def create_voices_json(audio_path, text, voice_name, output_path="voices.json", 
         voices_data["default_voice"] = voice_name
     
     # Save to file
+    output_path = os.path.abspath(output_path)
+    parent_dir = os.path.dirname(output_path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
     with open(output_path, 'w', encoding='utf-8') as f:
         json.dump(voices_data, f, ensure_ascii=False, indent=2)
     

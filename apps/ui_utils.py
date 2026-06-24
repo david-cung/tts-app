@@ -428,70 +428,223 @@ def prepare_best_voice_training_reference(
     }
     return output_path, metadata
 
+def _ensure_sentence_punctuation(text: str) -> str:
+    text = (text or "").strip()
+    if text and text[-1] not in ".,?!":
+        text += "."
+    return text
+
+def _collect_training_clips_from_files(
+    media_files,
+    *,
+    min_duration=3,
+    max_duration=15,
+    silence_ms=600,
+    progress=None,
+):
+    """Turn one or more uploaded files into a flat list of training WAV clip paths.
+
+    For each file we try VAD-based splitting first. If VAD finds no usable segment
+    but the original file is itself a clean short clip (between min/max duration),
+    we keep it as a single clip. Returns (clip_paths, warnings).
+    """
+    if media_files is None:
+        raise ValueError("Vui lòng upload ít nhất một file audio.")
+    if isinstance(media_files, str) or hasattr(media_files, "name"):
+        media_files = [media_files]
+    media_files = [m for m in media_files if m]
+    if not media_files:
+        raise ValueError("Vui lòng upload ít nhất một file audio.")
+
+    all_clips = []
+    warnings = []
+    for index, source in enumerate(media_files, start=1):
+        source_path = _coerce_audio_path(source)
+        if not source_path or not os.path.isfile(source_path):
+            warnings.append(f"Bỏ qua file thứ {index}: không đọc được.")
+            continue
+        if progress:
+            progress(f"✂️ ({index}/{len(media_files)}) cắt `{os.path.basename(source_path)}`...")
+        try:
+            clips = _split_media_to_clips(
+                source_path,
+                min_duration=min_duration,
+                max_duration=max_duration,
+                silence_ms=silence_ms,
+            )
+        except ValueError:
+            clips = []
+
+        if clips:
+            all_clips.extend(clips)
+            continue
+
+        # Fallback: a short clean WAV may have no VAD-split output. Use as-is if
+        # its duration sits inside the valid range.
+        try:
+            info = sf.info(source_path)
+        except Exception:
+            info = None
+        duration = float(info.duration) if info else 0.0
+        if min_duration <= duration <= max_duration:
+            normalized = _normalize_short_clip_to_wav(source_path)
+            all_clips.append(normalized)
+        else:
+            warnings.append(
+                f"Bỏ qua `{os.path.basename(source_path)}`: không tách được đoạn "
+                f"3–{int(max_duration)}s (độ dài {duration:.1f}s)."
+            )
+    return all_clips, warnings
+
+
+def _normalize_short_clip_to_wav(source_path):
+    """Re-encode a short clip to 16k mono PCM_16 WAV in a temp dir for dataset use."""
+    try:
+        from faster_whisper.audio import decode_audio
+    except ImportError as exc:
+        raise RuntimeError(
+            "Chưa cài faster-whisper. Hãy cài dependency ASR rồi khởi động lại app."
+        ) from exc
+
+    sample_rate = 16_000
+    audio = np.asarray(decode_audio(source_path, sampling_rate=sample_rate), dtype=np.float32)
+    if audio.size == 0:
+        raise ValueError(f"File `{os.path.basename(source_path)}` không có dữ liệu audio.")
+
+    output_dir = os.path.join(
+        tempfile.gettempdir(),
+        "vieneu_tts_training_short",
+        uuid.uuid4().hex,
+    )
+    os.makedirs(output_dir, exist_ok=True)
+    stem = _safe_training_filename(os.path.basename(source_path)).rsplit(".", 1)[0]
+    output_path = os.path.join(output_dir, f"{stem}.wav")
+    sf.write(output_path, audio, sample_rate, subtype="PCM_16")
+    return output_path
+
+
+def _split_media_to_clips(media_file, min_duration=3, max_duration=15, silence_ms=600):
+    """Split one media file into local WAV clip paths for LoRA dataset prep."""
+    source = _coerce_audio_path(media_file)
+    if not source:
+        raise ValueError("Vui lòng upload một file audio hoặc video.")
+
+    source = os.path.abspath(os.fspath(source))
+    if not os.path.isfile(source):
+        raise FileNotFoundError(f"Không tìm thấy file nguồn: {source}")
+
+    min_duration = float(min_duration)
+    max_duration = float(max_duration)
+    silence_ms = int(silence_ms)
+    if min_duration < 1 or max_duration <= min_duration:
+        raise ValueError("Thời lượng tối đa phải lớn hơn thời lượng tối thiểu.")
+
+    try:
+        from faster_whisper.audio import decode_audio
+        from faster_whisper.vad import VadOptions, get_speech_timestamps
+    except ImportError as exc:
+        raise RuntimeError(
+            "Chưa cài faster-whisper. Hãy cài dependency ASR rồi khởi động lại app."
+        ) from exc
+
+    sample_rate = 16_000
+    audio = np.asarray(decode_audio(source, sampling_rate=sample_rate), dtype=np.float32)
+    if audio.size == 0:
+        raise ValueError("File nguồn không có dữ liệu audio.")
+
+    vad_options = VadOptions(
+        min_speech_duration_ms=250,
+        max_speech_duration_s=max_duration,
+        min_silence_duration_ms=max(100, silence_ms),
+        speech_pad_ms=150,
+    )
+    speech_chunks = get_speech_timestamps(audio, vad_options, sampling_rate=sample_rate)
+    segments = _build_vad_training_segments(
+        speech_chunks,
+        total_samples=len(audio),
+        min_samples=int(min_duration * sample_rate),
+        max_samples=int(max_duration * sample_rate),
+    )
+    if not segments:
+        raise ValueError("Không phát hiện được đoạn có giọng nói trong file.")
+
+    source_stem = _safe_training_filename(os.path.basename(source)).rsplit(".", 1)[0]
+    output_dir = os.path.join(
+        tempfile.gettempdir(),
+        "vieneu_tts_training_split",
+        uuid.uuid4().hex,
+    )
+    os.makedirs(output_dir, exist_ok=True)
+
+    output_paths = []
+    for index, (start, end) in enumerate(segments, start=1):
+        output_path = os.path.join(output_dir, f"{source_stem}_{index:04d}.wav")
+        sf.write(output_path, audio[start:end], sample_rate, subtype="PCM_16")
+        output_paths.append(output_path)
+    return output_paths
+
+def _transcribe_clip_paths(audio_paths, whisper_model_size="small"):
+    model = _get_whisper_model(whisper_model_size)
+    transcripts = []
+    for audio_path in audio_paths:
+        segments, _ = model.transcribe(
+            audio_path,
+            language="vi",
+            beam_size=5,
+            condition_on_previous_text=False,
+        )
+        text = " ".join(segment.text.strip() for segment in segments if segment.text.strip())
+        text = _ensure_sentence_punctuation(" ".join(text.split()))
+        if not text or text == ".":
+            raise ValueError(f"Không tạo được transcript cho `{os.path.basename(audio_path)}`.")
+        transcripts.append(text)
+    return transcripts
+
+def persist_training_dataset_entries(
+    audio_paths,
+    transcripts,
+    dataset_dir,
+    *,
+    clear_existing=False,
+):
+    if len(audio_paths) != len(transcripts):
+        raise ValueError("Số file WAV và số transcript không khớp.")
+
+    raw_audio_dir = os.path.join(dataset_dir, "raw_audio")
+    metadata_path = os.path.join(dataset_dir, "metadata.csv")
+    if clear_existing and os.path.isdir(dataset_dir):
+        shutil.rmtree(dataset_dir)
+    os.makedirs(raw_audio_dir, exist_ok=True)
+
+    used_names = set()
+    saved_rows = []
+    for source_path, transcript in zip(audio_paths, transcripts):
+        dest_name = _unique_training_filename(raw_audio_dir, os.path.basename(source_path), used_names)
+        dest_path = os.path.join(raw_audio_dir, dest_name)
+        shutil.copy2(source_path, dest_path)
+        saved_rows.append((dest_name, transcript))
+
+    with open(metadata_path, "w", encoding="utf-8") as handle:
+        for file_name, transcript in saved_rows:
+            handle.write(f"{file_name}|{transcript}\n")
+    return len(saved_rows)
+
 def split_voice_training_media(media_file, min_duration=3, max_duration=15, silence_ms=600):
     """Split one long audio/video file into training WAV clips using Silero VAD."""
     try:
+        output_paths = _split_media_to_clips(
+            media_file,
+            min_duration=min_duration,
+            max_duration=max_duration,
+            silence_ms=silence_ms,
+        )
         source = _coerce_audio_path(media_file)
-        if not source:
-            raise ValueError("Vui lòng upload một file audio hoặc video dài.")
-
-        source = os.path.abspath(os.fspath(source))
-        if not os.path.isfile(source):
-            raise FileNotFoundError(f"Không tìm thấy file nguồn: {source}")
-
-        min_duration = float(min_duration)
-        max_duration = float(max_duration)
-        silence_ms = int(silence_ms)
-        if min_duration < 1 or max_duration <= min_duration:
-            raise ValueError("Thời lượng tối đa phải lớn hơn thời lượng tối thiểu.")
-
-        try:
-            from faster_whisper.audio import decode_audio
-            from faster_whisper.vad import VadOptions, get_speech_timestamps
-        except ImportError as exc:
-            raise RuntimeError(
-                "Chưa cài faster-whisper. Hãy cài dependency ASR rồi khởi động lại app."
-            ) from exc
-
-        sample_rate = 16_000
-        audio = np.asarray(decode_audio(source, sampling_rate=sample_rate), dtype=np.float32)
-        if audio.size == 0:
-            raise ValueError("File nguồn không có dữ liệu audio.")
-
-        vad_options = VadOptions(
-            min_speech_duration_ms=250,
-            max_speech_duration_s=max_duration,
-            min_silence_duration_ms=max(100, silence_ms),
-            speech_pad_ms=150,
-        )
-        speech_chunks = get_speech_timestamps(audio, vad_options, sampling_rate=sample_rate)
-        segments = _build_vad_training_segments(
-            speech_chunks,
-            total_samples=len(audio),
-            min_samples=int(min_duration * sample_rate),
-            max_samples=int(max_duration * sample_rate),
-        )
-        if not segments:
-            raise ValueError("Không phát hiện được đoạn có giọng nói trong file.")
-
-        source_stem = _safe_training_filename(os.path.basename(source)).rsplit(".", 1)[0]
-        output_dir = os.path.join(
-            tempfile.gettempdir(),
-            "vieneu_tts_training_split",
-            uuid.uuid4().hex,
-        )
-        os.makedirs(output_dir, exist_ok=True)
-
-        output_paths = []
-        for index, (start, end) in enumerate(segments, start=1):
-            output_path = os.path.join(output_dir, f"{source_stem}_{index:04d}.wav")
-            sf.write(output_path, audio[start:end], sample_rate, subtype="PCM_16")
-            output_paths.append(output_path)
+        source_name = os.path.basename(source) if source else "file"
 
         rows, warnings = _training_audio_rows(output_paths)
-        speech_seconds = sum((end - start) / sample_rate for start, end in segments)
+        speech_seconds = sum(sf.info(path).duration for path in output_paths)
         status = (
-            f"✅ Đã cắt {len(output_paths)} đoạn WAV từ `{os.path.basename(source)}` "
+            f"✅ Đã cắt {len(output_paths)} đoạn WAV từ `{source_name}` "
             f"({_format_duration(speech_seconds)} có tiếng nói)."
         )
         if warnings:
@@ -952,7 +1105,7 @@ def add_custom_voice_from_dataset(voice_display_name):
     threading.Thread(target=worker, daemon=True).start()
 
     while not result["done"]:
-        yield "\n\n".join(messages), gr.update(), gr.update(selected="preset_mode"), gr.update()
+        yield "\n\n".join(messages), gr.update(), gr.update(), gr.update()
         time.sleep(2)
 
     if result["error"]:
@@ -963,6 +1116,54 @@ def add_custom_voice_from_dataset(voice_display_name):
     entry = result["entry"]
     messages.append(
         f"✅ Giọng **{entry['display_name']}** đã sẵn sàng trong tab **Preset** (biểu tượng 🎤)."
+    )
+    voice_update = build_registered_voice_dropdown_update(entry["voice_id"])
+    yield "\n\n".join(messages), voice_update, gr.update(selected="preset_mode"), gr.update(interactive=True)
+
+def train_lora_from_voice_sample(voice_display_name, media_files):
+    import threading
+
+    from finetune.voice_training_pipeline import run_voice_training_from_media_files
+
+    if media_files is None:
+        media_list = []
+    elif isinstance(media_files, (list, tuple)):
+        media_list = [m for m in media_files if m]
+    else:
+        media_list = [media_files]
+
+    messages = [
+        f"⏳ Đang chuẩn bị train LoRA từ {len(media_list)} file mẫu...",
+        "Theo dõi tiến độ theo từng dòng bên dưới. **Bước 3/5** sẽ hiện `steps X/Y` và cập nhật mỗi ~25 steps.",
+    ]
+    result = {"entry": None, "error": None, "done": False}
+
+    def worker():
+        try:
+            result["entry"] = run_voice_training_from_media_files(
+                voice_display_name,
+                media_list,
+                progress=lambda message: messages.append(message),
+            )
+        except Exception as exc:
+            result["error"] = str(exc)
+        finally:
+            result["done"] = True
+
+    threading.Thread(target=worker, daemon=True).start()
+
+    while not result["done"]:
+        yield "\n\n".join(messages), gr.update(), gr.update(), gr.update()
+        time.sleep(2)
+
+    if result["error"]:
+        messages.append(f"❌ Train LoRA thất bại: {result['error']}")
+        yield "\n\n".join(messages), gr.update(), gr.update(), gr.update()
+        return
+
+    entry = result["entry"]
+    messages.append(
+        f"✅ Giọng LoRA **{entry['display_name']}** đã sẵn sàng trong tab **Preset** (🎤)."
     )
     voice_update = build_registered_voice_dropdown_update(entry["voice_id"])
     yield "\n\n".join(messages), voice_update, gr.update(selected="preset_mode"), gr.update(interactive=True)

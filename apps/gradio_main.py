@@ -28,6 +28,7 @@ import queue
 import threading
 import yaml
 import uuid
+from typing import Optional
 from vieneu_utils.core_utils import split_text_into_chunks, join_audio_chunks, env_bool, get_silence_duration_v2
 from vieneu_utils.phonemize_text import phonemize_to_chunks
 from sea_g2p import Normalizer
@@ -56,8 +57,10 @@ from apps.ui_utils import (
     preview_trained_voice_audio,
     build_registered_voice_dropdown_update,
     add_custom_voice_from_dataset,
+    train_lora_from_voice_sample,
 )
 from apps.user_voice_runtime import get_user_voice_entry, merge_voice_dropdown_choices, synthesize_registered_voice
+from apps.model_session import load_model_session, save_model_session, should_auto_load_model
 from apps.ui_constants import (
     theme,
     css,
@@ -152,6 +155,7 @@ using_lmdeploy = False
 PRESET_VOICES_CACHE = []  # List of all voices (tuples or strings)
 CONV_VOICES_CACHE = []    # Filtered list for conversation (podcast=True)
 MAX_SPEAKERS = 8          # Max concurrent speakers in conversation tab
+_SERVER_AUTO_LOAD_DONE = False
 
 # Normalizer (module-level singleton)
 _text_normalizer = Normalizer()
@@ -220,19 +224,146 @@ def get_model_status_message() -> str:
         f"🎵 Codec: {current_codec} on {codec_device}{preencoded_note}{opt_info}"
     )
 
+def _btn_load_idle():
+    return gr.update(value="🔄 Tải Model", interactive=True, visible=True)
+
+def _btn_load_loading():
+    return gr.update(value="⏳ Đang tải model...", interactive=False, visible=True)
+
+def _btn_load_loaded():
+    return gr.update(value="✅ Model đã tải — bấm để tải lại", interactive=True, visible=True)
+
+def _startup_status_message() -> str:
+    if model_loaded and tts is not None:
+        return get_model_status_message()
+    session = load_model_session(APP_ROOT)
+    if session and should_auto_load_model(APP_ROOT):
+        backbone = session.get("backbone", "model")
+        return (
+            f"⏳ Đang khởi động lại **{backbone}** từ lần trước...\n\n"
+            "Lần đầu sau khi tải model thành công, app sẽ tự nhớ và không cần bấm lại."
+        )
+    if session:
+        return (
+            f"ℹ️ Lần trước bạn đã dùng **{session.get('backbone', 'model')}**. "
+            "Bấm **Tải Model** để nạp lại vào RAM."
+        )
+    return "⏳ Chưa tải model. Bấm **Tải Model** để bắt đầu."
+
+def build_startup_voice_dropdown_update(selected_voice_id: Optional[str] = None):
+    """Show saved/custom voices before the main model is loaded into memory."""
+    quick_voices = []
+    for record in _read_user_voice_index().get("voices", []):
+        voice_id = record.get("id")
+        if not voice_id:
+            continue
+        label = record.get("description") or voice_id
+        quick_voices.append((f"🎙️ {label}", voice_id))
+
+    if model_loaded and tts is not None:
+        try:
+            model_voices = tts.list_preset_voices()
+        except Exception:
+            model_voices = []
+        choices = merge_voice_dropdown_choices(model_voices or quick_voices)
+        if not choices:
+            return gr.update(choices=[], value=None, interactive=False)
+
+        selected_value = None
+        if selected_voice_id:
+            for item in choices:
+                value = item[1] if isinstance(item, (list, tuple)) else item
+                if value == selected_voice_id or value == f"user_voice:{selected_voice_id}":
+                    selected_value = value
+                    break
+        if selected_value is None:
+            first = choices[0]
+            selected_value = first[1] if isinstance(first, (list, tuple)) else first
+        return gr.update(choices=choices, value=selected_value, interactive=True)
+
+    choices = merge_voice_dropdown_choices(quick_voices or None)
+    if not choices:
+        return gr.update(choices=[], value=None, interactive=False)
+
+    selected_value = None
+    if selected_voice_id:
+        prefixed = f"user_voice:{selected_voice_id}"
+        for item in choices:
+            value = item[1] if isinstance(item, (list, tuple)) else item
+            if value in {selected_voice_id, prefixed}:
+                selected_value = value
+                break
+    if selected_value is None:
+        first = choices[0]
+        selected_value = first[1] if isinstance(first, (list, tuple)) else first
+    return gr.update(choices=choices, value=selected_value, interactive=True)
+
+def _persist_loaded_model_session(
+    backbone_choice: str,
+    codec_choice: str,
+    device_choice: str,
+    force_lmdeploy: bool,
+    custom_model_id: str = "",
+    custom_base_model: str = "",
+):
+    save_model_session(
+        APP_ROOT,
+        {
+            "backbone": backbone_choice,
+            "codec": codec_choice,
+            "device": device_choice,
+            "force_lmdeploy": bool(force_lmdeploy),
+            "custom_model_id": (custom_model_id or "").strip(),
+            "custom_base_model": custom_base_model or "",
+        },
+    )
+
 def restore_ui_state():
     """Update UI components based on persistence"""
     global model_loaded
-    msg = get_model_status_message()
     from finetune.voice_registry import list_user_voice_dropdown_choices
 
-    can_generate = model_loaded or bool(list_user_voice_dropdown_choices())
+    msg = _startup_status_message()
+    can_generate = model_loaded or bool(list_user_voice_dropdown_choices()) or bool(
+        _read_user_voice_index().get("voices")
+    )
+    btn_load_update = _btn_load_loaded() if model_loaded else _btn_load_idle()
     return (
         msg,
         gr.update(interactive=can_generate),  # btn_generate
         gr.update(interactive=model_loaded),  # btn_generate_conv
         gr.update(interactive=False),         # btn_stop
         build_registered_voice_dropdown_update(),
+        btn_load_update,
+    )
+
+def auto_load_model_on_startup(
+    backbone_choice,
+    codec_choice,
+    device_choice,
+    force_lmdeploy,
+    custom_model_id="",
+    custom_base_model="",
+    custom_hf_token="",
+):
+    """Reload the last successful model config once per server start (not every page refresh)."""
+    global _SERVER_AUTO_LOAD_DONE
+    if _SERVER_AUTO_LOAD_DONE or model_loaded or not should_auto_load_model(APP_ROOT):
+        return
+
+    session = load_model_session(APP_ROOT)
+    if not session:
+        return
+
+    _SERVER_AUTO_LOAD_DONE = True
+    yield from load_model(
+        session.get("backbone") or backbone_choice,
+        session.get("codec") or codec_choice,
+        session.get("device") or device_choice,
+        session.get("force_lmdeploy", force_lmdeploy),
+        session.get("custom_model_id") or custom_model_id,
+        session.get("custom_base_model") or custom_base_model,
+        custom_hf_token,
     )
 
 def should_use_lmdeploy(backbone_choice: str, device_choice: str) -> bool:
@@ -273,7 +404,7 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
         "⏳ Đang tải model với tối ưu hóa... Lưu ý: Quá trình này sẽ tốn thời gian. Vui lòng kiên nhẫn.",
         gr.update(interactive=False), # btn_generate
         gr.update(interactive=False), # btn_generate_conv
-        gr.update(interactive=False), # btn_load
+        _btn_load_loading(),
         gr.update(interactive=False), # btn_stop
         gr.update(), # voice_select
         gr.update(), gr.update(), gr.update(), gr.update(), # tab_p, tab_c, tab_sel, mode_state
@@ -296,7 +427,7 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
             if not custom_model_id or not custom_model_id.strip():
                 yield (
                     "❌ Lỗi: Vui lòng nhập Model ID cho Custom Model.",
-                    gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=True), gr.update(interactive=False), gr.update(),
+                    gr.update(interactive=False), gr.update(interactive=False), _btn_load_idle(), gr.update(interactive=False), gr.update(),
                     gr.update(), gr.update(), gr.update(), gr.update(),
                     gr.update(), # conv_tab
                     *slot_no_updates
@@ -310,7 +441,7 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
                 if custom_base_model not in BACKBONE_CONFIGS:
                     yield (
                         f"❌ Lỗi: Base Model '{custom_base_model}' không hợp lệ.",
-                        gr.update(interactive=False), gr.update(interactive=False), gr.update(interactive=True), gr.update(interactive=False),
+                        gr.update(interactive=False), gr.update(interactive=False), _btn_load_idle(), gr.update(interactive=False),
                         gr.update(), gr.update(), gr.update(), gr.update(), gr.update(),
                         gr.update(), # conv_tab
                         *slot_no_updates
@@ -643,6 +774,14 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
         current_backbone = backbone_choice
         current_codec = codec_choice
         model_loaded = True
+        _persist_loaded_model_session(
+            backbone_choice,
+            codec_choice,
+            device_choice,
+            force_lmdeploy,
+            custom_model_id,
+            custom_base_model,
+        )
         user_voice_count = load_user_trained_voices()
         
         # Success message with optimization info
@@ -765,7 +904,7 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
             success_msg,
             gr.update(interactive=True), # btn_generate
             gr.update(interactive=True), # btn_generate_conv
-            gr.update(interactive=True), # btn_load
+            _btn_load_loaded(),
             gr.update(interactive=False), # btn_stop
             voice_update,
             tab_p, tab_c, tab_sel, mode_state,
@@ -784,7 +923,7 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
                 "❌ Lỗi khi tải model: Không tìm thấy biến môi trường CUDA_PATH. Vui lòng cài đặt NVIDIA GPU Computing Toolkit (https://developer.nvidia.com/cuda/toolkit)",
                 gr.update(interactive=False),
                 gr.update(interactive=False), # btn_generate_conv
-                gr.update(interactive=True), # btn_load
+                _btn_load_idle(),
                 gr.update(interactive=False), # btn_stop
                 gr.update(), # voice_select
                 gr.update(), gr.update(), gr.update(), gr.update(),
@@ -796,7 +935,7 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
                 f"❌ Lỗi khi tải model: {str(e)}",
                 gr.update(interactive=False),
                 gr.update(interactive=False),
-                gr.update(interactive=True),
+                _btn_load_idle(),
                 gr.update(interactive=False),
                 gr.update(),
                 gr.update(), gr.update(), gr.update(), gr.update(),
@@ -978,6 +1117,140 @@ def refresh_voice_choices(selected_voice=None):
     slot_updates = [gr.update(choices=CONV_VOICES_CACHE, value=value)] * MAX_SPEAKERS
     return voice_update, slot_updates
 
+def _parse_speed_label(label) -> float:
+    try:
+        text = str(label or "1x").strip().lower().rstrip("x")
+        speed = float(text)
+    except Exception:
+        return 1.0
+    return max(0.5, min(3.0, speed))
+
+
+def apply_playback_speed(speed_label, current_audio, original_audio):
+    """Server-side time-stretch the audio when the speed dropdown changes.
+
+    `original_audio` keeps the un-stretched (1x) file path so repeated speed
+    changes always start from the original render, avoiding cumulative quality
+    loss. Returns (audio for player, new original state).
+    """
+    speed = _parse_speed_label(speed_label)
+    source = original_audio if original_audio and os.path.isfile(original_audio) else current_audio
+    if not source or not os.path.isfile(source):
+        return gr.update(), original_audio
+
+    if abs(speed - 1.0) < 1e-3:
+        return source, source
+
+    try:
+        import librosa
+        import numpy as _np
+        import soundfile as _sf
+
+        data, sr = _sf.read(source)
+        if data.ndim > 1:
+            data = data.mean(axis=1)
+        stretched = librosa.effects.time_stretch(_np.asarray(data, dtype=_np.float32), rate=speed)
+
+        out_path = os.path.join(
+            tempfile.gettempdir(),
+            f"vieneu_speed_{uuid.uuid4().hex[:8]}.wav",
+        )
+        _sf.write(out_path, stretched, sr)
+        return out_path, source
+    except Exception as exc:
+        gr.Warning(f"Không đổi được tốc độ: {exc}", title="Lỗi đổi tốc độ")
+        return current_audio, original_audio
+
+
+def remember_original_audio(audio_path, speed_label, original_audio):
+    """Record the 1x source whenever a fresh generation lands in the player.
+
+    The audio component fires `.change` continuously while a generator yields, so
+    we only update the remembered original when the new path is distinct AND the
+    user is currently at 1x speed (otherwise the new value is a stretched copy).
+    """
+    if not audio_path:
+        return original_audio
+    if audio_path == original_audio:
+        return original_audio
+    if abs(_parse_speed_label(speed_label) - 1.0) < 1e-3:
+        return audio_path
+    return original_audio
+
+
+def save_voice_clone_as_preset(voice_name, clone_audio):
+    """Save the audio currently used for Voice Cloning as a reusable preset voice.
+
+    Reuses the same encode + persist path as the Training tab, but accepts the
+    single audio file from the Voice Cloning workflow. The new voice is selected
+    immediately in the Preset dropdown so the user can use it right away.
+    """
+    slot_no_updates = [gr.update()] * MAX_SPEAKERS
+    hidden = gr.update(visible=False)
+
+    if not model_loaded or tts is None:
+        return (
+            gr.update(value="## ⚠️ Chưa tải model — hãy bấm **Tải Model** trước khi lưu preset.", visible=True),
+            gr.update(),
+            gr.update(),
+            "custom_mode",
+            *slot_no_updates,
+        )
+
+    if not clone_audio:
+        return (
+            gr.update(value="## ⚠️ Chưa có audio mẫu — hãy upload trước khi lưu.", visible=True),
+            gr.update(),
+            gr.update(),
+            "custom_mode",
+            *slot_no_updates,
+        )
+
+    try:
+        stable_audio, clip_info = prepare_best_voice_training_reference(clone_audio)
+        voice_id = _make_unique_voice_id(
+            voice_name or os.path.splitext(os.path.basename(stable_audio))[0]
+        )
+        description = f"{voice_id} (voice cloning)"
+
+        codes = tts.encode_reference(stable_audio)
+        codes = _to_numpy_codes(codes)
+
+        tts._preset_voices[voice_id] = {
+            "description": description,
+            "codes": codes,
+            "text": "",
+            "reserved_id": None,
+            "podcast": True,
+            "user_created": True,
+        }
+        _save_user_voice_record(voice_id, description, codes, stable_audio)
+
+        voice_update, slot_updates = refresh_voice_choices(selected_voice=voice_id)
+        status = (
+            f"## ✅ Đã lưu giọng `{voice_id}` vào Preset\n\n"
+            f"Đã chuyển sang tab **Preset** và chọn sẵn giọng này — bạn có thể nhập "
+            "văn bản rồi bấm **Bắt đầu** để dùng ngay."
+        )
+        gr.Info(f"Đã lưu giọng {voice_id} vào Preset.", title="Hoàn tất")
+        return (
+            gr.update(value=status, visible=True),
+            voice_update,
+            gr.update(selected="preset_mode"),
+            "preset_mode",
+            *slot_updates,
+        )
+    except Exception as exc:
+        gr.Warning(f"Không thể lưu preset: {exc}", title="Lưu thất bại")
+        return (
+            gr.update(value=f"## ❌ Không thể lưu: {exc}", visible=True),
+            gr.update(),
+            gr.update(),
+            "custom_mode",
+            *slot_no_updates,
+        )
+
+
 def create_user_training_voice(voice_name, training_voice_file):
     """Create a reusable local voice preset from one uploaded reference file."""
     slot_no_updates = [gr.update()] * MAX_SPEAKERS
@@ -990,6 +1263,12 @@ def create_user_training_voice(voice_name, training_voice_file):
             "training_mode",
             *slot_no_updates,
     )
+
+    # File picker may now return a list when multiple files are uploaded; clone
+    # only needs one reference, so we keep the first non-empty entry.
+    if isinstance(training_voice_file, (list, tuple)):
+        first = next((f for f in training_voice_file if f), None)
+        training_voice_file = first
 
     try:
         stable_audio, clip_info = prepare_best_voice_training_reference(training_voice_file)
@@ -2079,6 +2358,18 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                                     # v3 clones from audio only — the reference transcript box
                                     # is hidden for v3 (toggled by on_backbone_change).
                                     custom_text = gr.Textbox(label="Nội dung audio mẫu - vui lòng gõ đúng nội dung của audio mẫu - kể cả dấu câu vì model rất nhạy cảm với dấu câu (.,?!)", visible=False)
+                                    with gr.Row():
+                                        save_clone_name = gr.Textbox(
+                                            label="Lưu thành Preset (tuỳ chọn)",
+                                            placeholder="Ví dụ: Giọng anh A",
+                                            scale=2,
+                                        )
+                                        btn_save_clone_preset = gr.Button(
+                                            "💾 Lưu thành Preset",
+                                            variant="secondary",
+                                            scale=1,
+                                        )
+                                    save_clone_status = gr.Markdown(visible=False)
                                     gr.Examples(
                                         examples=[
                                             [os.path.join(os.path.dirname(os.path.dirname(__file__)), "examples", "audio_ref", "example.wav"), "Ví dụ 2. Tính trung bình của dãy số."],
@@ -2098,16 +2389,22 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                                         scale=1,
                                     )
                                     training_voice_file = gr.File(
-                                        label="Upload file giọng đọc (app tự chọn đoạn tốt nhất)",
-                                        file_count="single",
+                                        label="Upload 1+ file giọng đọc (WAV/MP3/video). LoRA dùng tất cả; clone chỉ dùng file đầu.",
+                                        file_count="multiple",
                                         file_types=[".wav", ".mp3", ".flac", ".m4a", ".ogg", ".aac",
                                                     ".mp4", ".mov", ".mkv", ".webm"],
                                         type="filepath",
                                         scale=2,
                                     )
-                                btn_train_voice = gr.Button("🎯 Training giọng này", variant="primary")
+                                with gr.Row():
+                                    btn_train_voice = gr.Button("🎯 Training giọng này", variant="primary")
+                                    btn_train_lora = gr.Button("🏋️ Train LoRA từ file mẫu", variant="secondary")
                                 training_status = gr.Markdown(
-                                    "Upload file có một người nói rõ, app sẽ tự cắt đoạn tốt nhất rồi tạo giọng. Giọng mới sẽ xuất hiện trong **Preset** để dùng ngay.",
+                                    "**🎯 Training giọng này** — clone nhanh từ 1 đoạn mẫu (cần **Tải Model**), dùng ngay trong Preset. "
+                                    "Nếu upload nhiều file, app chỉ dùng file đầu tiên.\n\n"
+                                    "**🏋️ Train LoRA từ file mẫu** — tự cắt file → transcript → train LoRA (cần **GPU**, 30–90 phút). "
+                                    "Upload **1+ file**: file dài sẽ được cắt theo VAD, file ngắn (3–15s) dùng nguyên. "
+                                    "Cần ít nhất ~5 đoạn sạch. Giọng mới xuất hiện trong **Preset** (🎤).",
                                     container=True,
                                 )
 
@@ -2339,6 +2636,15 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
                     type="filepath",
                     autoplay=True
                 )
+                with gr.Row():
+                    playback_speed = gr.Dropdown(
+                        choices=["0.75x", "1x", "1.25x", "1.5x", "1.75x", "2x"],
+                        value="1x",
+                        label="⏩ Tốc độ phát",
+                        interactive=True,
+                        scale=1,
+                    )
+                original_audio_state = gr.State(None)
                 with gr.Group():
                     status_output = gr.Textbox(
                         label="Trạng thái", 
@@ -2361,7 +2667,23 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
             inputs=[codec_select, current_mode_state], 
             outputs=[tab_custom, tabs, current_mode_state]
         )
-        
+
+        # Track the original 1x render so repeated speed changes always stretch
+        # from the un-modified audio (no cumulative artifacts).
+        audio_output.change(
+            fn=remember_original_audio,
+            inputs=[audio_output, playback_speed, original_audio_state],
+            outputs=[original_audio_state],
+        )
+
+        # Time-stretch on the server (preserves pitch) so the player really plays
+        # at the chosen speed — independent of Gradio's audio widget internals.
+        playback_speed.change(
+            fn=apply_playback_speed,
+            inputs=[playback_speed, audio_output, original_audio_state],
+            outputs=[audio_output, original_audio_state],
+        )
+
         # Bind tab events to update state
         tab_preset.select(lambda: "preset_mode", outputs=current_mode_state)
         tab_custom.select(lambda: "custom_mode", outputs=current_mode_state)
@@ -2377,6 +2699,19 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
             fn=create_user_training_voice,
             inputs=[training_voice_name, training_voice_file],
             outputs=[training_status, voice_select, tabs, current_mode_state, *speaker_voice_dds]
+        )
+
+        btn_save_clone_preset.click(
+            fn=save_voice_clone_as_preset,
+            inputs=[save_clone_name, custom_audio],
+            outputs=[save_clone_status, voice_select, tabs, current_mode_state, *speaker_voice_dds],
+        )
+
+        btn_train_lora.click(
+            fn=train_lora_from_voice_sample,
+            inputs=[training_voice_name, training_voice_file],
+            outputs=[training_status, voice_select, tabs, btn_generate],
+            show_progress="full",
         )
 
         training_audio_files.change(
@@ -2576,11 +2911,55 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
         # relying instead on the frequent _STOP_EVENT.is_set() checks in the code.
         btn_stop.click(fn=request_stop, outputs=[audio_output, status_output, estimate_output, btn_stop])
 
-        # Persistence: Restore UI state on load
+        # Persistence: restore UI on load; auto-load model once per server start only
         demo.load(
             fn=restore_ui_state,
-            outputs=[model_status, btn_generate, btn_generate_conv, btn_stop, voice_select]
+            outputs=[model_status, btn_generate, btn_generate_conv, btn_stop, voice_select, btn_load],
         )
+
+        @demo.load(
+            inputs=[
+                backbone_select,
+                codec_select,
+                device_choice,
+                use_lmdeploy_cb,
+                custom_backbone_model_id,
+                custom_backbone_base_model,
+                custom_backbone_hf_token,
+            ],
+            outputs=[
+                model_status,
+                btn_generate,
+                btn_generate_conv,
+                btn_load,
+                btn_stop,
+                voice_select,
+                tab_preset,
+                tab_custom,
+                tabs,
+                current_mode_state,
+                conv_tab,
+                *speaker_voice_dds,
+            ],
+        )
+        def auto_load_model_on_startup_event(
+            backbone_choice,
+            codec_choice,
+            device_choice,
+            force_lmdeploy,
+            custom_model_id,
+            custom_base_model,
+            custom_hf_token,
+        ):
+            yield from auto_load_model_on_startup(
+                backbone_choice,
+                codec_choice,
+                device_choice,
+                force_lmdeploy,
+                custom_model_id,
+                custom_base_model,
+                custom_hf_token,
+            )
 
 def main():
     # Cho phép override từ biến môi trường (hữu ích cho Docker)

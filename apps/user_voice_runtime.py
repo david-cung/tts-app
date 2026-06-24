@@ -86,8 +86,11 @@ def _load_user_voice_tts(entry: dict):
         backbone_device=device,
         codec_repo="neuphonic/distill-neucodec",
         codec_device=device,
+        gguf_filename=None,
     )
     tts.load_lora_adapter(lora_path)
+    if hasattr(tts, "backbone") and hasattr(tts.backbone, "eval"):
+        tts.backbone.eval()
     voices_json = os.path.join(lora_path, "voices.json")
     if os.path.isfile(voices_json):
         tts._load_voices_from_file(Path(voices_json))
@@ -128,7 +131,28 @@ def clear_user_voice_cache() -> None:
         _USER_TTS_CACHE.clear()
 
 
-def synthesize_registered_voice(text: str, voice_choice: str, temperature: float = 1.0) -> tuple[str, str]:
+def _evict_voice_cache(voice_choice: Optional[str]) -> None:
+    """Drop a voice's cached TTS so the next attempt reloads cleanly.
+
+    We intentionally do NOT unregister the voice here: failures on Apple MPS are
+    often transient (sporadic NaN logits), and deleting a usable voice on a single
+    bad attempt is worse than asking the user to retry.
+    """
+    if not is_user_voice_choice(voice_choice):
+        return
+    voice_id = parse_user_voice_choice(voice_choice)
+    with _USER_TTS_LOCK:
+        cached = _USER_TTS_CACHE.pop(voice_id, None)
+        if cached is not None:
+            close_fn = getattr(cached, "close", None)
+            if callable(close_fn):
+                try:
+                    close_fn()
+                except Exception:
+                    pass
+
+
+def synthesize_registered_voice(text: str, voice_choice: str, temperature: float = 0.7) -> tuple[str, str]:
     entry = get_user_voice_entry(voice_choice)
     if not entry:
         raise ValueError("Giọng tự train không tồn tại.")
@@ -149,12 +173,32 @@ def synthesize_registered_voice(text: str, voice_choice: str, temperature: float
         if isinstance(ref_codes, torch.Tensor):
             ref_codes = ref_codes.cpu().numpy()
 
-    wav = infer_tts.infer(
-        text.strip(),
-        ref_codes=ref_codes,
-        ref_text=ref_text,
-        temperature=temperature,
-    )
+    try:
+        wav = infer_tts.infer(
+            text.strip(),
+            ref_codes=ref_codes,
+            ref_text=ref_text,
+            temperature=temperature,
+        )
+    except RuntimeError as exc:
+        message = str(exc).lower()
+        if "probability tensor" in message or "inf" in message or "nan" in message:
+            _evict_voice_cache(voice_choice)
+            raise RuntimeError(
+                "Giọng LoRA sinh logits không ổn định trên máy này (NaN/Inf) — thường do "
+                "Apple MPS. Hãy **bấm tạo lại** (lỗi này thường chỉ thoáng qua). Nếu lặp lại "
+                "nhiều lần, hãy Train LoRA lại với nhiều đoạn mẫu rõ hơn."
+            ) from exc
+        raise
+    except ValueError as exc:
+        if "speech token" in str(exc).lower():
+            _evict_voice_cache(voice_choice)
+            raise ValueError(
+                "Lần tạo này chưa ra audio hợp lệ (thường thoáng qua trên Apple MPS). "
+                "Hãy **bấm tạo lại** một lần nữa. Nếu vẫn lỗi sau vài lần, hãy Train LoRA "
+                "lại với nhiều đoạn mẫu rõ hơn (8–10 đoạn, mỗi đoạn 3–15 giây)."
+            ) from exc
+        raise
     sample_rate = getattr(infer_tts, "sample_rate", 24000)
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
         sf.write(tmp.name, wav, sample_rate)

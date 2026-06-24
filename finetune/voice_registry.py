@@ -126,3 +126,14 @@ def register_voice(
     save_registry(registry)
     entry["voice_id"] = voice_id
     return entry
+
+
+def unregister_voice(voice_id: str) -> bool:
+    """Remove a voice from the registry. Returns True if it existed."""
+    registry = load_registry()
+    voices = registry.setdefault("voices", {})
+    if voice_id in voices:
+        del voices[voice_id]
+        save_registry(registry)
+        return True
+    return False

@@ -25,7 +25,7 @@ class VieNeuTTS(BaseVieneuTTS):
         codec_repo: str = "neuphonic/neucodec-onnx-decoder-int8",
         codec_device: str = "cpu",
         hf_token: Optional[str] = None,
-        gguf_filename: Optional[str] = "VieNeu-TTS-v2-Q4-K-M.gguf",
+        gguf_filename: Optional[str] = None,
         emotion: str = "natural",
     ):
         super().__init__()
@@ -96,8 +96,13 @@ class VieNeuTTS(BaseVieneuTTS):
         backbone_device = normalize_device(backbone_device)
         logger.info(f"Loading backbone from: {backbone_repo} on {backbone_device} ...")
 
-        is_gguf = gguf_filename or backbone_repo.lower().endswith("gguf") or "gguf" in backbone_repo.lower()
+        is_gguf = (
+            backbone_repo.lower().endswith("gguf")
+            or "gguf" in backbone_repo.lower()
+            or bool(gguf_filename)
+        )
         if is_gguf:
+            gguf_filename = gguf_filename or "VieNeu-TTS-v2-Q4-K-M.gguf"
             try:
                 from llama_cpp import Llama
             except ImportError as e:
@@ -126,11 +131,14 @@ class VieNeuTTS(BaseVieneuTTS):
                 self.tokenizer.pad_token = self.tokenizer.eos_token
 
             import torch
+            load_dtype = torch.float32 if backbone_device == "mps" else None
             self.backbone = AutoModelForCausalLM.from_pretrained(
-                backbone_repo, 
-                token=hf_token, 
-                trust_remote_code=True
+                backbone_repo,
+                token=hf_token,
+                trust_remote_code=True,
+                torch_dtype=load_dtype,
             ).to(torch.device(backbone_device))
+            self.backbone.eval()
 
             # Optional torch.compile for non-Windows/non-Mac platforms if desired
             if os.getenv("VIENEU_COMPILE") == "1" and platform.system() == "Linux":
@@ -266,22 +274,18 @@ class VieNeuTTS(BaseVieneuTTS):
             # Move all tensors to device
             inputs = {k: v.to(self.backbone.device) for k, v in inputs.items()}
 
-            speech_end_id = self.tokenizer.convert_tokens_to_ids("<|SPEECH_GENERATION_END|>")
-            with torch.no_grad():
-                output_tokens = self.backbone.generate(
-                    **inputs,
-                    max_length=self.max_context,
-                    eos_token_id=speech_end_id,
-                    do_sample=True,
+            batch_outputs = []
+            for i in range(len(texts)):
+                output_tokens = self._torch_generate(
+                    inputs["input_ids"][i : i + 1],
                     temperature=temperature,
                     top_k=top_k,
-                    use_cache=True,
-                    min_new_tokens=50,
                 )
+                batch_outputs.append(output_tokens)
 
             input_length = inputs["input_ids"].shape[-1]
             for i in range(len(texts)):
-                generated_ids = output_tokens[i, input_length:]
+                generated_ids = batch_outputs[i][0, input_length:]
                 output_str = self.tokenizer.decode(generated_ids, add_special_tokens=False)
                 wav = self._decode(output_str)
                 if apply_watermark:
@@ -344,23 +348,83 @@ class VieNeuTTS(BaseVieneuTTS):
 
         return ids
 
+    def _build_logits_sanitizer(self):
+        """LogitsProcessor that scrubs NaN/Inf logits.
+
+        Apple MPS (float32) intermittently emits inf/NaN logits for long prompts,
+        which crashes multinomial sampling and makes greedy decoding pick garbage
+        (non-speech) tokens. Cleaning the raw model logits each step keeps both
+        sampling and greedy numerically stable.
+        """
+        import torch
+        from transformers import LogitsProcessor, LogitsProcessorList
+
+        class _SanitizeLogits(LogitsProcessor):
+            def __call__(self, input_ids, scores):
+                return torch.nan_to_num(scores, nan=0.0, posinf=1e4, neginf=-1e4)
+
+        return LogitsProcessorList([_SanitizeLogits()])
+
+    def _torch_generate(self, prompt_tensor, *, temperature: float = 1.0, top_k: int = 50):
+        import torch
+
+        speech_end_id = self.tokenizer.convert_tokens_to_ids("<|SPEECH_GENERATION_END|>")
+        base_kwargs = dict(
+            max_length=self.max_context,
+            eos_token_id=speech_end_id,
+            use_cache=True,
+            min_new_tokens=50,
+            logits_processor=self._build_logits_sanitizer(),
+        )
+        temp = max(float(temperature), 0.05)
+        attempts = (
+            {"do_sample": True, "temperature": temp, "top_k": top_k},
+            {"do_sample": True, "temperature": 0.7, "top_k": 40},
+            {"do_sample": False},
+        )
+        last_error = None
+        with torch.no_grad():
+            for sample_kwargs in attempts:
+                try:
+                    return self.backbone.generate(prompt_tensor, **base_kwargs, **sample_kwargs)
+                except RuntimeError as exc:
+                    message = str(exc).lower()
+                    if "probability tensor" in message or "inf" in message or "nan" in message:
+                        last_error = exc
+                        logger.warning(
+                            "Sampling failed (%s), retrying with safer decode settings...",
+                            exc,
+                        )
+                        continue
+                    raise
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Torch generation failed without a specific error.")
+
     def _infer_torch(self, prompt_ids: List[int], temperature: float = 1.0, top_k: int = 50) -> str:
         import torch
         prompt_tensor = torch.tensor(prompt_ids).unsqueeze(0).to(self.backbone.device)
-        speech_end_id = self.tokenizer.convert_tokens_to_ids("<|SPEECH_GENERATION_END|>")
-        with torch.no_grad():
-            output_tokens = self.backbone.generate(
+        input_length = prompt_tensor.shape[-1]
+
+        # MPS instability is intermittent: a run may occasionally yield no speech
+        # tokens. Retry a few times before giving up so a valid voice isn't flagged broken.
+        output_str = ""
+        for attempt in range(3):
+            output_tokens = self._torch_generate(
                 prompt_tensor,
-                max_length=self.max_context,
-                eos_token_id=speech_end_id,
-                do_sample=True,
                 temperature=temperature,
                 top_k=top_k,
-                use_cache=True,
-                min_new_tokens=50,
             )
-        input_length = prompt_tensor.shape[-1]
-        output_str = self.tokenizer.decode(output_tokens[0, input_length:].cpu().numpy().tolist(), add_special_tokens=False)
+            output_str = self.tokenizer.decode(
+                output_tokens[0, input_length:].cpu().numpy().tolist(),
+                add_special_tokens=False,
+            )
+            if extract_speech_ids(output_str):
+                return output_str
+            logger.warning(
+                "Generation produced no speech tokens (attempt %d/3); retrying...",
+                attempt + 1,
+            )
         return output_str
 
     def _infer_ggml(self, ref_codes: Any, ref_phonemes: str, chunk_phonemes: str, temperature: float = 1.0, top_k: int = 50, emotion_tag: Optional[str] = None) -> str:

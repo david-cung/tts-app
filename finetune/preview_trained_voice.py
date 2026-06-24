@@ -51,11 +51,20 @@ def _is_lora_checkpoint_dir(path: str) -> bool:
 
 
 def find_dataset_reference(dataset_dir: Optional[str] = None) -> tuple[Optional[str], Optional[str]]:
+    """Return the best dataset clip + transcript to use as cloning reference.
+
+    Prefers the longest clip in the 4–13s window for better voice context.
+    """
+    import soundfile as sf
+
     dataset_dir = dataset_dir or os.path.join(_project_root(), "finetune", "dataset")
     metadata_candidates = (
         os.path.join(dataset_dir, "metadata_cleaned.csv"),
         os.path.join(dataset_dir, "metadata.csv"),
     )
+
+    best: tuple[float, str, str] | None = None
+    fallback: tuple[str, str] | None = None
 
     for metadata_path in metadata_candidates:
         if not os.path.isfile(metadata_path):
@@ -71,8 +80,20 @@ def find_dataset_reference(dataset_dir: Optional[str] = None) -> tuple[Optional[
                 if not filename or not text:
                     continue
                 audio_path = os.path.join(dataset_dir, "raw_audio", filename)
-                if os.path.isfile(audio_path):
-                    return audio_path, text
+                if not os.path.isfile(audio_path):
+                    continue
+                if fallback is None:
+                    fallback = (audio_path, text)
+                try:
+                    duration = float(sf.info(audio_path).duration)
+                except Exception:
+                    continue
+                if 4.0 <= duration <= 13.0 and (best is None or duration > best[0]):
+                    best = (duration, audio_path, text)
+        if best is not None:
+            return best[1], best[2]
+    if fallback is not None:
+        return fallback
     return None, None
 
 
@@ -138,6 +159,7 @@ def generate_training_preview(
     base_model: str = DEFAULT_BASE_MODEL,
     codec_repo: str = DEFAULT_CODEC_REPO,
     device: Optional[str] = None,
+    dataset_dir: Optional[str] = None,
 ) -> str:
     """Synthesize preview audio for a LoRA checkpoint and return the WAV path."""
     checkpoint_dir = _resolve_checkpoint_path(checkpoint)
@@ -148,7 +170,7 @@ def generate_training_preview(
     ref_audio_path = ref_audio
     ref_text_value = ref_text
     if not ref_audio_path or not ref_text_value:
-        dataset_ref_audio, dataset_ref_text = find_dataset_reference()
+        dataset_ref_audio, dataset_ref_text = find_dataset_reference(dataset_dir)
         ref_audio_path = ref_audio_path or dataset_ref_audio
         ref_text_value = ref_text_value or dataset_ref_text
 
@@ -202,6 +224,7 @@ def generate_training_preview(
         codec_repo=codec_repo,
         codec_device=device,
         hf_token=None,
+        gguf_filename=None,
     )
     try:
         tts.load_lora_adapter(checkpoint_dir)
@@ -223,6 +246,37 @@ def generate_training_preview(
         ref_audio=ref_audio_path,
         ref_text=ref_text_value,
     )
+    return output_path
+
+
+def validate_checkpoint_generates_audio(
+    checkpoint: str,
+    *,
+    text: Optional[str] = None,
+    dataset_dir: Optional[str] = None,
+    min_rms: float = 1e-4,
+) -> str:
+    """Synthesize preview and fail if output is empty or near-silent."""
+    import numpy as np
+    import soundfile as sf
+
+    output_path = generate_training_preview(
+        checkpoint,
+        text=text,
+        dataset_dir=dataset_dir,
+    )
+    data, _sample_rate = sf.read(output_path)
+    if data is None or len(data) == 0:
+        raise RuntimeError("Preview WAV rỗng.")
+
+    arr = np.asarray(data, dtype=np.float64)
+    if arr.ndim > 1:
+        arr = arr.mean(axis=1)
+    rms = float(np.sqrt(np.mean(arr**2)))
+    if rms < min_rms:
+        raise RuntimeError(
+            f"Preview gần như im lặng (rms={rms:.2e}). Checkpoint chưa học được giọng."
+        )
     return output_path
 
 
